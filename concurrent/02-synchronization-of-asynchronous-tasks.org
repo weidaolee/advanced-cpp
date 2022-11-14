@@ -1,0 +1,303 @@
+#+TITLE: 異步任務的同步
+* =future= 存在的意義
+此如果一個任務沒有返回值、且一旦執行就被 =detach= 的場景, 這種單純的背景執行的任務, 只需要 =std::thread= 就能滿足:
+#+begin_src cpp
+void background_task();
+int main() {
+    auto t = std::thread(background_task);
+    t.detach();
+    return 0;
+}
+#+end_src
+但是當我們需要同步時, =std::thread= 有以下不足, 這些不足極大限制 =std::thread= 完成異步轉同步、同步轉異步場景的需求:
+ * =std::thread= 沒有 return
+ * =std::thread= 之間的同步只有 =join()=
+ * =std::thread= 沒有處理異常的能力
+
+=future= 可以看作是在異步任務的同步的方向上, 提供了更豐富功能的 =std::thread=:
+ * 允許接收 return, 並且有 =get=, =wait=, =wait_for=, =wait_until= 等多種同步方案
+ * =std::async(...)= 是 =future= 任務的發布函數, 一旦調用 =std::async(...)= 後 =future= 任務將被發射 =launch=
+ * =packaged_task= 是 =thread= 和 =future= 的 =adapter=, 透過 =packaged_task= 可以調用 =std::thread= 接口執行 =future= 任務 (而非一定要調用 =std::async(...)=)
+ * 透過 =promise= 可以輕鬆實現異步轉同步, 並且能夠保存異步任務執行時發生的異常, 交給同步任務捕獲
+ * =shared_future= 能夠作到多個異步任務等待某個 =future= 任務同步
+
+目前 /C++/ 標準支持的 =future= 在 =<future>= 庫中, 有 =unique= 語意的 =std::future=, 以及 =shared= 語意的 =std::shared_future=, 另外, =std::experimental= 底下也有 =future= 和 =shared_future=, 它們提供了更豐富的功能。 注意, 在 =std::experimental= 意在強調這些實現尚未被加入 /C++/ 標準 (而非質量低下), 這些方法正式納入 /C++/ 標準後其語法可能會有所不同
+* 透過 =std::async(...)= 發布 future 任務
+=std::future<R>= 是 =template class=, 其中 =template argument= 是異步任務(函數)的返回類型, 該類型要與函數的返回類型相同; =std::async(...)= 是 =future= 任務的發布接口, 相當於 =std::thread(...)=; 當 =future= 任務被發布, 我們就可以透過 =get=, =wait=, =wait_for=, =wait_until= 等多種方式來同步該異步任務, 比如透過 =future.get()= 來同步:
+#+begin_src cpp
+class ReturnType {};
+ReturnType async_task();
+void do_something();
+void process_result(ReturnType &result);
+
+void demo() {
+    std::future<ReturnType> task = std::async(async_task); // 1
+    do_something();
+    ReturnType reslut = task.get(); // 2
+    process_result(reslut);
+}
+#+end_src
+1. 注意, =std::future<T>= 是 =template=, 需要傳入 =T=, 即異步任務的 =return type=, 我們這裡以 =ReturnType= 表示
+2. 當調用 =task.get()= 會進入阻塞等待直到結果被 return
+** std::async(...) 傳遞參數原則
+=std::async(...)= 的傳參原則與 =std::thread= 相同: 會先把傳入的 =actual arg= 傳入線程做為 =replica=, 再透過 =rval= 的方式做為 =function= 的 =actual arg=
+ * 自動轉型的 /const Arg& arg/
+   由於並不是 =detach=, 所以通常不會有生存期間的問題, 直接傳參即可, 不需要由我們主動轉型
+ * =function= 有接收 =lval= 的 =formal arg= /Arg arg/
+   同 =std::thread=, 傳入 =std::async= 的 =actual arg= 會建立 =replica= 並被以 =rval= 的方式做為 =function= 的 =actual arg=; 又 =function= 的 =formal arg= 是 =lval=, 則會發生編譯錯誤, 此情況需要我們主動以 =std::ref()= 對 =lval= 的參數進行封裝
+   #+begin_src cpp
+   std::string async_task(std::string &data) {
+       std::this_thread::sleep_for(std::chrono::seconds(3));
+       std::stringstream ss;
+       ss << "thread id: " << std::this_thread::get_id() << " process data: " << data;
+       return ss.str();
+   };
+
+   void do_something() {
+       std::cout << "do something..." << std::endl;
+   }
+
+   int main() {
+       std::string data = "hello";
+       std::future<std::string> task = std::async(async_task, std::ref(data));
+       do_something();
+       std::cout << task.get() << std::endl;
+       return 0;
+   }
+   #+end_src
+ * 如果異步任務本身是 =member function=, 且該函數的行為是需要併發保護的, 則同樣需要搭配 =mutex= 機制
+** =std::async(...)= 的 launch 策略
+=std::async(...)= 第一個參數可以傳入不同的 =launch= 策略, 這些策略在 =std::launch= 底下:
+ * =std::launch::async= 異步執行
+ * =std::launch::deferred= 推遲到關聯的 =future= 被 =wait()= 或 =get()= 才執行
+#+begin_src cpp
+std::string async_task(std::string &data) {
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::stringstream ss;
+    ss << "thread id: " << std::this_thread::get_id() << " process data: " << data;
+    return ss.str();
+};
+
+void do_something() {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::cout << "do something..." << std::endl;
+}
+
+using Clock = std::chrono::steady_clock;
+
+int main() {
+    std::string data = "hello";
+    auto start = Clock::now();
+    std::future<std::string> task = std::async( async_task, std::ref(data));
+    do_something();
+    std::cout << task.get() << std::endl;
+    auto sec = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count();
+    std::cout << "took " << sec << " seconds total" << std::endl;
+    return 0;
+}
+#+end_src
+
+reslut:
+#+begin_src text
+do something...
+thread id: 140285683267392 process data: hello
+took 5 seconds total
+#+end_src
+* =std::packaged_task<R(...)>= 的使用
+=std::packaged_task<R(...)>= 透過 =template function= 為 =thread= 和 =future= 提供 =adapter=, 它有以下用途:
+ * 使得 =future= 能透過 =std::thread=, 而非一定要調用 =std::async(...)=
+ * 提供一層抽象, 使得異步任務支持多態
+這些用途是 /C++/ 標準庫的線程池運作的基礎: 透過 =std::packaged_task<R(...)>= 封裝 =future= 任務, 使其可以被線程池的 =std::thread= 執行
+
+#+begin_src cpp
+int func();
+void process_result(int result);
+
+int main() {
+    std::packaged_task<int(void)> f(func);
+    auto task = f.get_future();
+    auto my_thread = std::thread(f);
+    my_thread.detach();
+    int result = task.get();
+    process_result(result);
+    return 0;
+}
+#+end_src
+
+注意, =function= 或 =function object= 經過 =std::packaged_task<R(...)>= 封裝後的 =f= 具有以下特徵:
+ 1. =f= 的 =operator()()= 就是 =function= 或 =function object=, 因此完全具備原函數的所有行為和能力
+ 2. 透過 =f.get_future()= 可以取得與其對映的 =std::future= 物件
+* 透過 =std::promise<R>= 實現異步轉同步
+假設有一個任務, 要處理的數據來自多個不同的數據源, 獲取數據的過程是異步的, 而處理數據的操作是同步的, 這就是經典的異步轉同步情境:
+#+begin_src cpp
+class Query {};
+class Data {};
+void get_data_from_local_db(std::promise<std::vector<Data*>> &promise, const Query &query) {
+    auto res = get_data_from_local_db(query);
+    promise.set_value(res);
+};
+void get_data_from_remote_db(std::promise<std::vector<Data*>> &promise, const Query &query) {
+    auto res = get_data_from_remote_db(query);
+    promise.set_value(res);
+};
+void process_data(std::vector<Data*> &local_data_coll, std::vector<Data*> &remote_data_coll);
+
+void demo() {
+    std::promise<std::vector<Data*>> local_promise;
+    std::promise<std::vector<Data*>> remote_promise;
+
+    auto local_db_query = Qyery();
+    auto remote_db_query = Qyery();
+
+    auto t1 = std::thread(std::ref(local_promise), local_db_query);
+    auto t2 = std::thread(std::ref(remote_promise), remote_db_query);
+
+    std::vector<Data*> local_data_coll = local_promise.get_future().get();
+    std::vector<Data*> remote_data_coll = remote_promise.get_future().get();
+    process_data(local_data_coll, remote_data_coll);
+};
+#+end_src
+* 透過 =std::promise<R>= 處理異步任務的異常
+設想某個後台運行的任務, 如果該任務正常執行, 則其行為與 =detach= 的 =std::thread= 完全相同, 但是如果該任務發生異常中止, 我們希望能夠捕獲, 只透過 =std::thread= 是不行的, 因為一旦 =detach= 則該任務就是一個完全異步、再也無法轉同步的任務, 而捕獲異常、進入異常處理的邏輯卻是一種異步轉同步
+
+透過 =std::thread= 實現, 需要由主線程 =join()= 或轉移給專門處理異常的線程:
+#+begin_src cpp
+struct MyEexeption : std::exception {
+    const char* what() const noexcept { return "MyEexeption"; }
+};
+
+void func() {
+    throw MyEexeption();
+};
+
+int main() {
+    auto t = std::thread(func);
+    t.join();
+    return 0;
+}
+#+end_src
+
+=std::promise= 可以透過 =std::promise.set_execption(...)= 來處理異步任務的異常:
+#+begin_src cpp
+void divide_task(std::promise<double> &promise, double a, double b) {
+    try {
+        promise.set_value(a / b);
+    } catch (...) {
+        promise.set_exception(std::current_exception());
+    }
+};
+
+int main() {
+    std::promise<double> promise;
+    auto t = std::thread(divide_task, std::ref(promise), 1, 0);
+    t.detach();
+    auto f = promise.get_future();
+    try {
+        std::cout << f.get() << std::endl;
+    } catch (const std::exception &e) {
+        std::cout << e.what() << std::endl;
+    }
+    return 0;
+}
+#+end_src
+* 透過 =std::shared_future= 實現多個異步任務的同步
+假設我們有多個異步任務要先等待某個任務先執行完成, 然後異步任務才能執行, 或是多個任務執行一段時間後, 需要先進行某種同步, 然後才能再進行異步處理, 這類多個異步任務之間的同步只透過 =std::future= 無法實現, 因為 =std::future= 具備 =unique= 語意, 它應當只被唯一的線程同步; 多個異步任務等待某個同步任務, 要透過 =std::shared_future= 來實現
+
+異步建立 table:
+#+begin_src cpp
+class Table {
+    private:
+        mutable std::mutex m_;
+        std::string table_name;
+        std::vector<std::string> table;
+    public:
+        Table(const std::string table_name) : table_name(table_name) {};
+        std::string get_name() { return table_name;};
+        void insert(std::string data) {
+            std::lock_guard<std::mutex> lk(m_);
+            table.push_back(data);
+        };
+};
+
+class DB {
+    private:
+        mutable std::mutex m_;
+    public:
+        std::unordered_map<std::string, Table*> tables;
+        void create_table(const std::string table_name) {
+            std::lock_guard<std::mutex> lk(m_);
+            if (tables.find(table_name) == tables.end()) {
+                tables[table_name] = new Table(table_name);
+            }
+        };
+};
+
+int main() {
+    std::promise<void> connect_db_promise;
+    std::shared_future<void> connect_db_future(connect_db_promise.get_future());
+    DB *db = nullptr;
+
+    auto open_db = [&] {
+        db = new DB();
+        connect_db_promise.set_value();
+    };
+
+    auto create_table = [&](const std::string table_name) {
+        connect_db_future.wait();
+        db->create_table(table_name);
+    };
+
+    auto t1 = std::thread(create_table, "T1");
+    auto t2 = std::thread(create_table, "T2");
+    open_db();
+    t1.join();
+    t2.join();
+
+    for (auto &[key, table] : db->tables) {
+        std::cout << table->get_name() << std::endl;
+    }
+    delete db;
+    return 0;
+}
+#+end_src
+
+#+begin_export text
+T2
+T1
+#+end_export
+
+
+* 限時等待任務
+除了 =get= 和 =wait= 之外, =std::future= 還有兩種與時限有關的同步方案:
+ * =std::future.wait_for(duration)= 等待一段時間
+ * =std::future.wait_until(time_point)= 等待到某個時間點
+
+這兩種同步方式 return 的是 =future_status=:
+ * =future_status::ready=
+ * =future_status::timeout=
+ * =future_status::deferred=
+
+=future_status::ready= 與 =future_status::timeout= 較好理解, 只要異步任務在時限內完成, 就會是 =ready=, 否則是 =timeout=; =deferred= 則是由於 =std::launch::deferred= 推遲了異步任務的執行, 因此該任務尚未開始
+
+透過 =future_status= 我們可以實現相當靈活的異步場景, 比如我們發起異步 I/O, 然後在 =wait_for= 期間讓出 CPU, 從 =wait_for= 返回後再次檢查狀態
+#+begin_src cpp
+using namespace std::chrono_literals;
+
+void io_task() {
+    std::this_thread::sleep_for(10s);
+};
+void do_process_data() {
+    std::cout << "do process io" << std::endl;
+};
+
+int main() {
+    auto aio_read_task = std::async(io_task);
+    while (aio_read_task.wait_for(1s) == std::future_status::timeout) {
+        std::this_thread::yield();
+    }
+    do_process_data();
+    return 0;
+}
+#+end_src
+* 其他併發任務同步工具
+/C++20/ 引入了 =semaphore=, =latch=, =barrier=

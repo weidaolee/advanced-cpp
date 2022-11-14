@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.9)
+project(threadsafe-queue)
+include_directories("${PROJECT_SOURCE_DIR}")
+add_compile_options("-std=c++20")
+add_executable(threadsafe-queue "demo.cc")

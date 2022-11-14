@@ -1,0 +1,429 @@
+#+TITLE: std::thread 的基礎使用
+本章內容涵蓋:
+ * 透過 =std::thread= 建立新的線程
+ * =std::thread= 的生存期間問題
+ * 透過 =std::thread= 的 constructor 向 =function= 傳遞參數
+ * =std::thread= 的移動語意, 以及所有權轉移
+ * 透過性能監控工具決定最佳線程數
+* 啟動一個新的 thread
+** hello =std::thread=
+=thread= 可以看做是一個擁有自己的 stack 空間、具有獨立的上下文信息的函數, 一旦被建立 (成功初始化), 即會參與任務調度, 此時我們可以認為該線程已經在異步運行該函數。 在 cpp 中, 建立新的 =thread= 的最簡單的方式:
+1. 初始化 =std::thread=, 其構造函數接收的參數是該線程要運行的函數指針, 一旦 =std::thread= 初始化完成, 該線程會自動參與調度並異步運行
+2. 初始化 =std::thread= 後, 應立刻決定由誰負責該線程的生命週期
+#+begin_src cpp
+void func();
+
+void demo() {
+    std::thread my_thread (func);
+    my_thread.join(); // 由 demo 負責 my_thread 的生命週期
+}
+#+end_src
+
+承載 function object:
+cpp 標準允許任何 =callable type= 做為 =std::thread= 的參數:
+#+begin_src cpp
+class Task {
+    public:
+        void operator()() const {
+            // do something...
+        };
+};
+
+void demo() {
+    Task background_task;
+    std::thread my_thread (background_task);
+    my_thread.join();
+}
+#+end_src
+** =std::thread= 初始化規範
+如果 =std::thread= 在初始化時傳入臨時變量, 則 =std::thread= 初始化會與聲明函數語意衝突:
+#+begin_src cpp
+std::thread my_thread(Task()); // my_thread 是函數, 接收參數是 Task 類型, 並 return std::thread 對象
+#+end_src
+因此, =std::thread= 初始化要求傳入臨時變量時, 使用以下方式:
+1. 加原括號
+2. 用列表初始化
+3. 使用顯示構造函數
+#+begin_src cpp
+std::thread my_thread ((Task()));
+std::thread my_thread {Task()};
+std::thread my_thread = std::thread(Task());
+#+end_src
+* 生存期間問題
+如果沒有明確聲明 =std::thread= 是應該被主線程回收 (join), 或是分離 (detach), 則主線程函數結束時, 會主動調用主線程所有函數內部建立的對象的 =destructor=, 包含主線程所創建的 =std::thread=, 該線程的函數可能會被 =std::thread.terminate()= 中止:
+#+begin_src cpp
+void task() {
+    // do something...
+};
+
+void oops() {
+    auto my_thread = std::thread(task);
+};
+#+end_src
+注意, =my_thread= 對象的生存期間只到 =oops()= 運行結束為止; 根據此案例, 在創建好 =my_thread= 後會立即退出, 因此會銷毀 =my_thread= 對象, 但是 =my_thread= 調用的函數可能還在運行。 因此只要初始化 =std::thread= 對象後, 就應該立刻確定該 =thread= 的生命週期; 避免此生存期間問題有兩種作法:
+1. 延長主線程的生命週期, 直到到子線程調用函數執行完為止
+   #+begin_src cpp
+   void demo() {
+       auto my_thread = std::thread(task);
+       my_thread.join();
+   };
+   #+end_src
+
+2. 讓子線程的生命週期完全脫離主線程
+   #+begin_src cpp
+   void demo() {
+       auto my_thread = std::thread(task);
+       my_thread.detach();
+   };
+   #+end_src
+** =detach= 的注意事項
+如果我們明確要 =detach=, 則要假設主線程會先結束; 若子線程所調用的函數/函數對象有 =pointer= 或 =reference= 指向了主線建立的對象, 則同樣會有生存期間問題, 以下是導致此類問題常見的情境:
+1. =my_thread= 調用的 =function= 是一個 =lamdba=, 而 =lamdba= 捕獲其他對象
+   #+begin_src cpp
+   void oops() {
+       std::string info = "big string...";
+       auto my_thread = std::thread([&](){
+           do_something(info);
+       };);
+
+       my_thread.detach();
+   };
+   #+end_src
+   注意, 這裡無論按值捕獲, 或是按引用捕獲, 都會有生存期間的問題, 因為 =lamdba= 嘗試捕獲時該作用域早已被銷毀
+2. =my_thread= 要運行的 =function= 是一個 =closure=, 而 =closure= 的局部變量持有了其他對象的 =reference=
+   #+begin_src cpp
+   class Task {
+       public:
+           Task(std::string &info) : info(info) {};
+           void operator()() {
+               // do something...
+           };
+       private:
+           std::string &info;
+   };
+
+   void oops() {
+       std::string info = "big string...";
+       Task background_task(info);
+       background_task.detach();
+   };
+   #+end_src
+** =join= 的注意事項
+如果我們明確要 =join=, 讓主線程等待 =my_thread= 的函數運行結束, 則要確保主線程不會意外中止而提前結束 (try/catch), 以下有可能因為捕獲異常而導致主線程提前結束:
+#+begin_src cpp
+void oops() {
+    auto my_thread = std::thread(func);
+    try {
+        do_something();
+    } catch (...) {
+        throw;
+    }
+    my_thread.join();
+};
+#+end_src
+如果 =oops= 先捕獲了 =exception=, 會導致 =oops= 提前結束, 或是在 =catch= 裡異常處理時, 一些對象被改變 (但並不是 =my_thread= 的函數所預期的)
+* 能捕獲異常的 =join=
+在主線程中 =try/catch= 會導致生存期間問題主要是因為, =catch= 的異常處理沒有 =join= 子線程的邏輯, 並且這改變了 =main= 的控制流程: 捕獲異常後, 執行 =catch block= 的代碼, 然後直接退出。 我們可以簡單的將 =join= 的邏輯加入異常處理, 避免該情況:
+#+begin_src cpp
+void demo() {
+    auto my_thread = std::thread(func);
+    try {
+        do_something();
+    } catch (...) {
+        my_thread.join();
+        throw;
+    }
+    my_thread.join();
+};
+#+end_src
+
+或者我們考慮經典的 =RAII= 實現; 使用 =thread_guard= 對 =std::thread= 包裝, 並在其 =destructor= 實現時先 =join=:
+#+begin_src cpp
+class thread_guard {
+    private:
+        std::thread &t; // 1
+    public:
+        explicit thread_guard(std::thread &t) : t(t) {};  // 2
+
+        thread_guard(const thread_guard &other) = delete;  // 3
+        thread_guard& operator=(const thread_guard &other) = delete; // 3
+        thread_guard(thread_guard &&other) = default;  // 4
+
+        ~thread_guard() noexcept { // 5
+            if (t.joinable()) {
+                t.join();
+            }
+        };
+};
+#+end_src
+1. =thread_guard= hold =std::thread=
+2. =thread_guard= 必須顯示構造, 不可隱式轉換
+3. =thread_guard= 的複製構造函數、拷貝付值被 delete, 不允許兩個 =guard= 負責相同的 =thread=, 否則會 =destruct= 會被調用兩次
+4. =thread_guard= 的移動構造函數, 可以確保其 hold 的 =t= 只會被一個 =guard= 保護
+5. =thread_guard= 的 =destructor= 負責 =join= 其 hold 的 =std::thread=
+
+注意, 如果要允許顯示調用構造函數, 必須要實做 =move constructor=, 但如果我們沒有定義 =move constructor= 則會默認調用 =copy constructor=, 而我們在實現 =thread_guard= 時以 delete 禁止了 =copy constructor=, 因此我們要實做 =move constructor=, 否則可能出現編譯錯誤 (至少要定義為 default, 在所有 member 可移動的情況下, 與我們親自移動等價)。
+使用:
+#+begin_src cpp
+void demo() {
+    auto my_thread = std::thread(func);
+    auto gurad = thread_guard(my_thread);
+    try {
+        // do something...
+    } catch (...) {
+        throw;
+    }
+}
+#+end_src
+* 向 =std::thread= 的函數傳遞參數
+=std::thread= 的構造函數, 第一個參數為 =callable= object (其實是 =pointer=), 也就是線程要運行的函數, =std::thread= 構造函數是可變參數, 第二個參數開始是接收運行的函數的參數:
+#+begin_src cpp
+void func(int i, const std::string &s);
+void demo() {
+    auto my_thread = std::thread(func, 0, "hi");
+    my_thread.detach();
+}
+#+end_src
+** 傳遞 cosnt 引用參數
+注意, 線程具有獨立的內部存儲空間, 向 =std::thread= 構造函數傳遞的, *傳遞給運行函數的參數*, 會以 *copy* 的方式先被複製到該存儲空間, 然後該 =replica= 會以 =rval= 的方式被訪問, 即便該函數是 =pass by reference= 的方式傳參數, 該過程依然會發生。 因此, 傳遞引用, 只是作用於 =function= 運作時, =reference= 這個線程內部存儲空間的 =replica= 。
+
+這個機制, 將有可能導致生存期間問題:
+#+begin_src cpp
+void func(int i, const std::string &s);
+void oops(int some_param) {
+    char buff[1024];
+    springf(buff, "%i", some_param);
+    auto my_thread = std::thread(func, 0, buff);
+    my_thread.detach();
+}
+#+end_src
+
+我們向 =std::thread= 的構造函數傳遞指針類型 =buff=, 期望新的線程將 =buff= 類型自動轉換為 =std::string= 類型的臨時變量, 但是在 =std::string= 類型的臨時變量被建立成功之前, =oops= 函數就退出了, 導致訪問的地址不合法
+
+因此, 我們在向 =std::thread= 的構造函數傳遞函數參數時, 如果該函數透過 /C++/ 的特性產生臨時變量, 我們需要在調用 =std::thread= 之前先構造好該臨時變量, 以避免該生存期間問題:
+#+begin_src cpp
+void func(int i, const std::string &s);
+void demo(int some_param) {
+    char buff[1024];
+    springf(buff, "%i", some_param);
+    auto my_thread = std::thread(func, 0, std::string(buff));
+    my_thread.detach();
+}
+#+end_src
+** 傳遞非 const 的引用參數
+如果我真的需要傳遞非 =const= 的引用, 剛才的方法會行不通, 並且會編譯失敗。 首先, 我們要傳遞引用, 但整個對象被複製一遍, 並且生成了臨時變量 (=rval=), 而函函數的非 const 的引用只接受 =lval=, 這種錯誤與我們的函數要的是非 =const= 引用, 而我們卻向函數傳遞表達式:
+#+begin_src cpp
+void update_data(Data &data);
+
+void oops() {
+    Data data;
+    auto my_thread(update_data, data);
+    my_thread.join();
+};
+#+end_src
+
+該錯誤問題在於, =function= 接收左值, 而 =std::thread= 的機制是以右值方式傳遞給 =function=, 因此我們需要透過 =ref= 語意來輔助:
+#+begin_src cpp
+void update_data(Data &data);
+
+void demo() {
+    Data data;
+    auto my_thread(update_data, std::ref(data));
+    my_thread.join();
+};
+#+end_src
+** 以某個成員函數做為 =thread= 的運行函數
+成員函數的第一個參數, 其實是該對象本身。 成員函數首先透過 =class= 得到函數指針, 然後透過 =object= 的地址, 得到該訪問的對象。 因此, 如果 =std::thread= 要運行的函數是對象的成員函數, 則也同樣依照此規則傳遞參數:
+#+begin_src cpp
+class Task {
+    public:
+        Task(int task_id) : task_id(task_id) {};
+        void run_task();
+    private:
+        int task_id;
+}
+void demo() {
+    Task task = Task(0);
+    auto my_thread(&Task::run_task(), &task);
+    my_thread.join();
+};
+#+end_src
+* 移交動態對象的所有權給其他線程
+我們可以透過 =unique pointer= 將動態對象的所有權移交給其他線程:
+#+begin_src cpp
+void process_big_object(std::unique_ptr<big_object> p);
+void demo() {
+    auto p = std::unique_ptr<big_object>(new big_object());
+    auto my_thread = std::thread(process_big_object, std::move(p));
+    my_thread.detach();
+};
+#+end_src
+這樣做的好處是, 該對象 =object= 雖然在別處被創建, 但是在 =my_thread= 構造成功時, =object= 被移交給 =my_thread=, 從而避免其生存期間問題, 該 =object= 會在 =process_big_object= 運行結束後被 =unique_ptr= 釋放掉。
+* 移交 =std::thread= 的所有權
+在啟動一個新線程時, 我們透過 =std::thread= 與 os 層面的 =thread= 關聯起來, 此時我們說 =std::thread= 擁有該 =thread= 的所有權。 =std::thread= 是支持移動的, 我們可以透過 =move= 來移交所有權。 =std::thread= 的移動與 =std::unique_ptr= 原則相同:
+1. 一個 os 的 =thread=, 被唯一的 =std::thread= 擁有
+2. 一旦被 =move= 移交, 即喪失所有權
+3. 一旦接收新的 =move=, 立即喪失原 =thread= 的所有權, 原 =function= 如果尚未運行結束, 會導致程序直接被中止 (=std::terminate=)
+#+begin_src cpp
+void func_A();
+void func_B();
+
+void demo() {
+    std::thread t1 {func_A};         // 1
+    std::thread t2 = std::move(t1);  // 2
+    t1 = std::thread(func_B);        // 3
+
+    std::thread t3;                  // 4
+    t3 = std::move(t2);              // 5
+    t1 = std::move(t3);              // 6
+};
+#+end_src
+1. =t1= 擁有第一個線程的所有權, 並執行 =func_A=
+2. =t1= 將第一個線程的所有權移交給 =t2=, 由 =t2= 負責該線程的 =func_A=
+3. =t1= 原本不擁有任何線程, 此時擁有新的線程, 並執行 =func_B=
+4. =t3= 被初始化, 但不擁有任何線程
+5. =t2= 將第一個線程的所有權移交給 =t3=, 由 =t3= 負責該線程的 =func_A=
+6. =t3= 將第一個線程的所有權移交給 =t1=, 注意, 此時 =t1= 原來負責 =func_B=, 會觸發程序直接被中止
+
+** 不明確的所有權都將觸發 =std::terminate()=
+注意, 如果一個線程沒有明確聲明由誰負責回收, 即便運行結束, 都會觸發 =std::terminate()=:
+#+begin_src cpp
+void func_A() {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "end of func A" << std::endl;
+};
+
+void func_B() {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "end of func B" << std::endl;
+}
+
+void oops() {
+    auto my_thread = std::thread(func_A);                        // 1
+    std::this_thread::sleep_for(std::chrono::seconds(3));        // 2
+    my_thread = std::thread(func_B);                             // 3
+    my_thread.join();                                            // 4
+};
+
+int main() {
+    oops();
+    return 0;
+};
+#+end_src
+
+result:
+#+begin_src text
+end of func A
+terminate called without an active exception
+fish: Job 1, './a.out' terminated by signal SIGABRT (Abort)
+#+end_src
+1. =my_thread= 負責運行 =func_A=
+2. =oops= 線程等待 3 秒, 此時 =my_thread= 的線程已經執行完畢
+3. =my_thread= 直接運行新的線程, 負責 =func_B=, 這步導致了 =std::terminate()=, 因為原來的 =thread= 沒有任何線程回收, 即便它已經執行完畢
+
+因此我們說, 一旦初始化線程, 就立刻要決定由誰負責回收, 如果我們決定 =detach= 則由 =daemon= 負責, 這個原則是因為由 cpp 的 API 所發起的線程, 都會有對映的 os 層面的 =thread= 去運行, 這個線程的生命週期必須嚴格在 cpp 應用的管轄範圍之內, 不可以有任何不確定的行為, 即便是分離 =detach=, 也同樣被 =daemon= 管轄。
+** 更安全優雅的 thread guard
+我們可以利用 =std::thread= 可移動的特性, 更完善 =thread_guard=:
+#+begin_src cpp
+class scoped_thread {
+    private:
+        std::thread t; // 1
+    public:
+        scoped_thread(std::thread t) : t(std::move(t)) { // 2
+            if (!t.joinable()) {
+                throw std::logic_error("not joinable.");
+            }
+        };
+        scoped_thread(const scoped_thread &other) = delete;
+        scoped_thread& operator=(const scoped_thread &other) = delete;
+
+
+        scoped_thread(scoped_thread &&other) noexcept = default;
+
+        virtual ~scoped_thread() noexcept { // 3
+            t.join();
+        };
+};
+#+end_src
+
+對比原來的 =thread_guard= 實現:
+#+begin_src cpp
+class thread_guard {
+    private:
+        std::thread &t; // 1
+    public:
+        explicit thread_guard(std::thread &t) : t(t) {};  // 2
+
+        thread_guard(const thread_guard &other) = delete;
+        thread_guard& operator=(const thread_guard &other) = delete;
+        thread_guard(thread_guard &&other) = default
+
+        ~thread_guard() noexcept { // 3
+            if (t.joinable()) {
+                t.join();
+            }
+        };
+};
+#+end_src
+最主要的區別在於, 原來的 =thread_guard= 的構造函數接收的 =std::thread &=, 這是一個 =lval=, 根據 cpp 的規則, 如果我們傳入 =rval=, 編譯將不會通過, 而 =scoped_thread= 的構造函數則接收的是 =std::thread=, 但透過初始化列表將 =std::thread= 以 =move= 的方式傳入, 因此 =scoped_thread= 可以接收 =rval=, 這樣的實做好處有以下:
+1. 我們可以利用 =scoped_thread= 直接構建新的線程
+2. 由於我們是直接透過 =move=, 將 =std::thread= 的所有權移交給 =scoped_thread=, 因此一旦 =scoped_thread= 接管了該 =thread=, 就沒有其他線程能對其執行 =join= 或 =detach=
+** jthread 實現
+實際上, =scoped_thread= 在 C++17 標準被討論是否要加入, 最終在 C++20 以 =jthread= 被納入標準, 以下是 =jthread= 可行的實現:
+#+begin_src cpp
+class joining_thread {
+    private:
+        std::thread t;
+
+    public:
+        joining_thread() noexcept = default;
+        template <typename Callable, typename... Args>
+        explicit joining_thread(Callable &&func, Args &&...args)
+            : t(std::forward<Callable>(func), std::forward<Args>(args)...) {}
+        explicit joining_thread(std::thread t_) noexcept : t(std::move(t_)) {}
+        joining_thread(joining_thread &&other) noexcept : t(std::move(other.t)) {}
+        joining_thread &operator=(joining_thread &&other) noexcept {
+            if (joinable())
+                join();
+            t = std::move(other.t);
+            return *this;
+        }
+        joining_thread &operator=(std::thread other) noexcept {
+            if (joinable())
+                join();
+            t = std::move(other);
+            return *this;
+        }
+        ~joining_thread() noexcept {
+            if (joinable())
+                join();
+        }
+        void swap(joining_thread &other) noexcept { t.swap(other.t); }
+        std::thread::id get_id() const noexcept { return t.get_id(); }
+        bool joinable() const noexcept { return t.joinable(); }
+        void join() { t.join(); }
+        void detach() { t.detach(); }
+        std::thread &as_thread() noexcept { return t; }
+        const std::thread &as_thread() const noexcept { return t; }
+};
+#+end_src
+* 最佳線程數
+假設我們有 N 個 CPU processor
+#+begin_src sh
+grep "model name" /proc/cpuinfo | wc -l
+#+end_src
+ * CPU 密集型任務
+   原則上, 如果任務都屬於純粹的 CPU 密集型運算, 增加線程數量只會提高任務切換的成本, 此類型可以設為 N + 1, 如果有調度發生, 在等待的線程可以立刻補上
+ * I/O 密集型或混合型
+   這裡我們直接將任務推廣至混合型, 也就是有的線程是 CPU 密集型, 有的情況是非 CPU 密集型 (I/O, 網路...等等), 我們可以由以下推導得到最佳線程數:
+   1. 假設單核情況, 最佳線程數是 *總耗時 / CPU 耗時*
+   2. 總耗時 / CPU 耗時 = (CPU 耗時 + 非 CPU 耗時) / CPU 耗時
+   3. 最佳線程數為 N * (CPU 耗時 + 非 CPU 耗時) / CPU 耗時
+
+可以先以測試單線程透過 =pidstat= 觀察指定進程的 CPU 使用率以及等待時間, 然後計算 N * (1 + %wait / %CPU) = num_task, 然後以 num_task 做為線程數:
+#+begin_src sh
+pidstat -p [pid] -I period
+#+end_src
+ * -p 監控指定進程的 CPU 使用情況
+ * -I 為將統計結果分攤到多個 CPU processors 的情況
+ * -t 監控線程的 CPU 使用情況

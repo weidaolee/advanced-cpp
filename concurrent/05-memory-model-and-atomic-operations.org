@@ -1,0 +1,67 @@
+#+TITLE: 內存模型和原子操作
+* =std::atomic<T>=
+=std::atomic<T>= 是泛型模板, 其中 =<T>= 表示任意類型, 包含用戶自定義類型
+** 不可複製且不可移動
+=copy constructor=, =copy assign= 都被禁止, 並不提供 =move constructor= 和 =move assign=, 因此也不具備 =move= 語意
+#+begin_src cpp
+      atomic() = default;
+      ~atomic() noexcept = default;
+      atomic(const atomic&) = delete;
+      atomic& operator=(const atomic&) = delete;
+      atomic& operator=(const atomic&) volatile = delete;
+
+      constexpr atomic(_Tp __i) noexcept : _M_i(__i) { }
+#+end_src
+** =assign=
+當我們自定義 =T= 時需要考慮到 =copy= 的額外開銷, 因為其 =assign= 與一般的類別不同; 其 =assign= 的接收與返回都是傳 =value=, 並且是模板參數類型 =T=
+#+begin_src cpp
+      _Tp
+      operator=(_Tp __i) noexcept
+      { store(__i); return __i; }
+
+      _Tp
+      operator=(_Tp __i) volatile noexcept
+      { store(__i); return __i; }
+#+end_src
+** =load= 和 =store=
+之所以對 =std::atomic<T>= 類型的構造、存取有這些限制, 是因為這些操作的 =memory order= 是未定義的, 而這些存取操作的 *順序性* 與 *可見性* 是需要合適的 =memory order= 才能確保不存在 =race condition=, 這些方法分為:
+ * =load=
+   #+begin_src cpp
+   T load( std::memory_order order = std::memory_order_seq_cst ) const noexcept;
+   #+end_src
+ * =store=
+   #+begin_src cpp
+   void store( T desired, std::memory_order order = std::memory_order_seq_cst ) noexcept;
+   #+end_src
+** =read-modify-write= CAS 操作
+/C++/ 的 =CAS= 區分 =weak= 和 =strong=, 這是因為即便比較後即便值真的相同, 也有可能 =CAS= 失敗, =strong= 會內含一個 =loop= 直到成功, 而 =weak= 則會直接 return =false=; 如果對 =expect= 的計算很大, 則可以考慮 =strong=
+ * =CAS= 成功則以指定的 =memory_order= 次序做 =read-modify-write=
+   =compare_exchange= 與 =exchange= 不同點在於: =compare_exchange= 獲得的是 =bool= 以表示 =CAS= 是否成功, 通常需要搭配 =loop= 使用; 而 =exchange= 獲得的是 =previous value=, 其實現已經隱含 =loop=:
+   #+begin_src cpp
+   bool compare_exchange_weak( T& expected, T desired,
+                               std::memory_order order =
+                                   std::memory_order_seq_cst ) noexcept;
+
+   bool compare_exchange_strong( T& expected, T desired,
+                                 std::memory_order order =
+                                     std::memory_order_seq_cst ) noexcept;
+
+   T exchange( T desired, std::memory_order order = std::memory_order_seq_cst )
+     noexcept;
+   T exchange( T desired, std::memory_order order = std::memory_order_seq_cst ) volatile
+     noexcept;
+   #+end_src
+
+ * =CAS= 成功以 =success= 次序做 =read-modify-write=; 失敗以 =failure= 次序做 =load=
+   由於 =CAS= 失敗時只有 =load= 操作而沒有 =store= 操作, 因此我們可以給失敗時採取更寬鬆的次序
+   #+begin_src cpp
+   bool compare_exchange_weak( T& expected, T desired,
+                               std::memory_order success,
+                               std::memory_order failure ) noexcept;
+   bool compare_exchange_strong( T& expected, T desired,
+                                 std::memory_order success,
+                                 std::memory_order failure ) noexcept;
+   #+end_src
+* Memory Order
+** Relaxed ordering
+ * 同一個線程的同一個 =atomic variable=, 在 T 時刻 =load= 或 =store=, 則永遠不會訪問到 T-1 的狀態

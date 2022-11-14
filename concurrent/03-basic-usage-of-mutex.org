@@ -1,0 +1,662 @@
+#+TITLE: mutex 的基礎使用
+本章內容涵蓋:
+ + 用於併發安全保護最簡單、常用的工具 =std::mutex=
+   + =std::mutex= 基礎使用
+   + 實現 =RAII= 的 =std::mutex= 工具 =std::lock_guard= 以及 =std::scoped_lock=
+   + 更加靈活的 =std::unique_lock=
+   + 搭配 =condition variable= 實現更豐富的同步需求
+ + 用於只保護共享數據初始化的技術
+   + =once_flag=, =call_once= 確保某函數只被調用一次
+   + =static= 的局部變量或類別成員初始化
+ + 併發安全問題初探
+   + =pointer= 或 =reference= 從臨界區中逃逸
+   + 併發安全操作的合併操作會破壞併發安全
+ + 死鎖問題與解決方案
+   + 透過 =std::lock(...)= 一次獲取所有需要的鎖
+   + 依次序上鎖以及層級鎖 =hierarchical_mutex= 方案
+   + 死鎖問題的補充準則
+* std::mutex
+=std::mutex= 是最基礎、常見的併發保護工具, 利用 =mutex.lock()=, =mutex.unlock()= 能規劃出一個 *臨界區* =critical section=, 該區間只允許同時只有唯一一個線程在執行, 其它線程想要進入任何同一個 =mutex= 的 *臨界區* 都會被阻塞在 =mutex.lock()= 語句, 直到成功 =lock= 為止:
+#+begin_src cpp
+class threadsafe_list {
+    private:
+        std::mutex m_;
+        std::list<int> list;
+    public:
+        void push_front(int val) {
+            m_.lock();
+            list.push_front(val);
+            m_.unlock();
+        };
+        void push_back(int val) {
+            m_.lock();
+            list.push_back(val);
+            m_.unlock();
+        };
+};
+#+end_src
+** RAII 實現
+以上作法的問題在於, 我們必須手動規劃臨界區; 我們可以考慮使用 =RAII= 的經典實現 =lock_guard=, 當要進入臨界區時建立新的 =lock_guard= 對象 =guard=, =guard= 會在被銷毀時主動調用 =unlock=:
+#+begin_src cpp
+class threadsafe_list {
+    private:
+        std::mutex m_;
+        std::list<int> list;
+    public:
+        void push_front(int val) {
+            std::lock_guard<std::mutex> guard(m_);
+            list.push_front(val);
+        };
+        void push_back(int val) {
+            std::lock_guard<std::mutex> guard(m_);
+            list.push_back(val);
+        };
+};
+#+end_src
+另外, C++17 引入新的特性 *模板類型參數推導(class template argument deduction)*, 對於 =std::lock_guard<>= 這種簡單的 template, 可以簡化成:
+#+begin_src cpp
+class threadsafe_list {
+    private:
+        std::mutex m_;
+        std::list<int> list;
+    public:
+        void push_front(int val) {
+            std::lock_guard guard(m_);
+            list.push_front(val);
+        };
+        void push_back(int val) {
+            std::lock_guard guard(m_);
+            list.push_back(val);
+        };
+};
+#+end_src
+** unique lock
+*** 更加靈活的 lock guard
+=std::unique_lock= 比起 =std::lock_guard= 更加靈活, 它可以不總是佔有與之關聯的 =mutex= 對象。 首先 =std::unique_lock= 的構造函數接收第二個參數, 我們可以傳入 =std::adopt_lock=, 以收養一個已經創建的 =mutex=; 也可以傳入 =std::defer_lock=, 使 =std::unique_lock= 在創建後只關聯該 =mutex= 而不佔有, 等以後在需要的時候在 =std::unique_lock= 上調用 =lock()= 進行上鎖, 以下代碼是等價的:
+#+begin_src cpp
+class Data;
+void swap(Data &l, Data &r);
+
+class DataWrapper {
+    private:
+        Data data;
+        mutable std::mutex m_;
+    public:
+        DataWrapper(const Data &data) : data(data) {};
+        friend void swap(DataWrapper &l, DataWrapper &r) {
+            if (&l == &r) {
+                return;
+            }
+            std::lock(l.m_, r.M.m_); // 1
+            std::lock_guard<std::mutex> l_guard(l.m_, std::adopt_lock); // 2
+            std::lock_guard<std::mutex> r_guard(e.m_, std::adopt_lock); // 2
+            swap(l.data, r.data);
+        }:
+};
+#+end_src
+
+#+begin_src cpp
+class Data;
+void swap(Data &l, Data &r);
+
+class DataWrapper {
+    private:
+        Data data;
+        mutable std::mutex m_;
+    public:
+        Data(const Data &data) : data(data) {};
+        friend void swap(DataWrapper &l, DataWrapper &r) {
+            if (&l == &r) {
+                return;
+            }
+            std::unique_lock<std::mutex> l_unique_lock(l.m_, std::defer_lock); // 1
+            std::unique_lock<std::mutex> r_unique_lock(r.m_, std::defer_lock); // 1
+            std::lock(l_unique_lock, r_unique_lock); // 2
+            swap(l.data, r.data);
+        };
+};
+#+end_src
+1. =std::unique_lock= 的構造函數傳入 =std::defer_lock=, 只關聯 =mutex= 對象而不上鎖
+2. =std::lock()= 傳入的對象是 =std::unique_lock=, 而不是 =mutex=
+
+可見 =std::unique_lock= 本身也是 =lockable= 的, 因此可以直接調用 =unique_lock.lock()= 與 =unique_lock.unlock()=, 不過由於它本身也是 =RAII= 實現, 因此可以不 =unlock()=, 讓 =unique_lock= 對象在被銷毀後自動調用 =unlock()=; 另外, =std::unique_lock= 的成本略高於 =std::lock_guard=, 因為它需要額外的 =state= 來表示當前關聯的 =mutex= 是否被該 =unique_lock= 佔有 (lock), 不過如果條件允許, 還是更推薦使用 /C++17/ 支持的 =scoped_lock=, 比如我們要轉移 =lock= 的所有權到其他作用域。
+*** 在不同 scope 之間轉移 unique lock
+=std::unique_lock= 符合移動語意, 屬於可移動但不可複製的類型, 我們可以讓 =unique_lock= hold 與其關聯的 =mutex=, 這樣 =mutex= 就能透過 =unique_lock= 在不同的作用域之間轉移。
+
+轉移可能在某些情況自動發生, 比如從函數 return =unique_lock=, 但有些情況下我們要顯式調用 =std::move=, 本質上這取決於要 =move= 的對象是 =rval= 還是 =lval=:
+ * =rval=: 該對象是臨時對象, =move= 會自動發生
+ * =lval=: 需要顯式調用 =move=
+
+轉移 =unique_lock= 有一種應用場景, 允許先 =lock=, 然後將其轉移給指定函數的調用者, 讓其在此 =mutex= 的保護下執行操作, 這種作法很適合將原本並不考慮 =data race= 的實現擴展成併發安全的實現, 但不入侵原有的代碼 (不過同樣要注意函數是否會暴露受保護的數據), 以下是這種場景的案例:
+=process_data= 會調用 =get_lock=, 而 =get_lock= 首先會獲取 =mutex= 並以 =unique_lock= 進行 =lock=, 然後在 =lock= 成功後對數據進行前期準備, 並 return 給後續接收的函數。
+#+begin_src cpp
+std::unique_lock<std::mutex> get_lock() {
+    extern std::mutex a_mutex;
+    std::unique_lock<std::mutex> lk(a_mutex);
+    prepare_data();
+    return lk;                                // 1
+};
+
+void process_data() {
+    auto lk = get_lock();
+    do_process();               // 2
+}
+#+end_src
+1. 注意, 由於 =lk= 是在某函數內創建的局部變量, 在 return 時是 =rval=, 編譯器會積極的調用 =move=, 因此此轉移是自動發生
+2. 在 =process_data()= 結束後, 由於我們沒有向外轉移所有權, 因此 =lk= 會在 =process_data= 被銷毀, =a_mutex= 會被釋放
+** 條件變量 condition variable
+要執行併發任務的線程如果除了獲取 =lock= 之外還要等待某些條件滿足, 才被喚醒並爭搶鎖, 如果不滿足的話就應該處於阻塞等待的狀態以避免佔用 CPU 資源, 這種情況可以使用 =condition variable= 工具來實現
+*** condition_variable 和 condition_variable_any
+使用 =std::condition_variable= 和 =std::condition_variable_any= 要 include =<condition_variable>=, 兩者的區別在於前者只可以與 =std::mutex= 最狹義的類型一起使用; 而後者可以搭配所有 =lockable= 類型一起使用
+
+場景描述:
+ * 線程 =t1= 負責生產數據, 並將準備好的數據放入 =deque= 中
+ * 線程 =t2= 負責消費數據, 從 =deque= 中取數據並處理
+ * 如果 =deque= 中沒有數據, =t2= 應該被阻塞
+
+demo:
+#+begin_src cpp
+std::deque<Data> data_que;
+std::mutex que_mutex;
+std::condition_variable que_not_empty;
+
+int main(int argc, char *argv[]) {
+    auto t1 = std::thread(prepare_data, 10); // 負責生產數據
+    auto t2 = std::thread(process_data);     // 負責消費數據
+    t1.join();
+    t2.join();
+    return 0;
+}
+#+end_src
+
+生產數據:
+#+begin_src cpp
+void prepare_data(int num_data) {
+    while (num_data-- > 0) {
+        auto data = Data();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // 模擬生產數據耗時
+        {
+            // 數據生產好後才須 lock, lock 的對象是 queue
+            std::lock_guard<std::mutex> guard(que_mutex);
+            data_que.push_back(data);
+        }
+        que_not_empty.notify_one(); // notify 前先 unlock 了
+    }
+    std::cout << "producer done." << std::endl;
+}
+#+end_src
+
+消費數據:
+#+begin_src cpp
+void process_data() {
+    while (true) {
+        std::unique_lock<std::mutex> lk(que_mutex); // 獲取 que_mutex
+        que_not_empty.wait(lk, [&]{return !data_que.empty();}); // 如果 empty, 則會進入 block, 直到 condition 滿足才會重新獲取 que_mutex
+        auto &data = data_que.front(); data_que.pop_front();    // 從 front 取 data
+        lk.unlock();                                            // 取完就可以 unlock 了
+        data.process();                                         // process 不需要被同步
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 模擬處理數據耗時
+    }
+}
+#+end_src
+*** 利用 condition variable 構建線程安全的 queue
+之前設計線程安全的 =stack= 時, 當我們遇到 =empty= 時直接報錯, 這種設計雖然安全, 但在併發情境下並不是好的設計; 比如, 在 =生產者消費者模式= 下, 當消費數據的線程在 =queue= 為空時, 應當等待 =queue= 為非空, 然後就可以被喚醒消費數據, 這樣的需求可使用 =condition variable= 來實現。
+
+理論上我們可以使用兩個 =mutex= 分別保護 =front= 和 =back=, 但這樣需要考慮到要 =queue.size()= 為 1 時兩個原本不相干的操作會耦合, 這部份我們留到後面的章節討論, 在這裡我們只使用一個 =mutex= 保護對整個 =queue= 的修改, 以下是 =ThreadSafeQueue= 的 =declaration=:
+#+begin_src cpp
+template<typename E>
+class ThreadSafeQueue {
+    private:
+        mutable std::mutex m_;
+        std::queue<E> q;
+        std::condition_variable not_empty;
+    public:
+        ThreadSafeQueue() {};
+        ThreadSafeQueue(const ThreadSafeQueue &other) {
+            std::lock_guard<std::mutex> guard(other.m_);
+            q = other.q;
+        };
+
+        virtual ~ThreadSafeQueue() noexcept = default;
+
+        void push(const E &element) {
+            std::lock_guard<std::mutex> guard(m_);
+            q.push(element);
+            not_empty.notify_one();
+        };
+
+        std::shared_ptr<E> pop() {
+            std::lock_guard<std::mutex> guard(m_);
+            not_empty.wait(m_, [this]{ return !q.empty(); });
+
+            std::shared_ptr<E> ptr = std::shared_ptr<E>(q.front());
+            q.pop();
+            return ptr;
+        };
+
+        bool try_pop(E *ptr) {
+            std::lock_guard<std::mutex> guard(m_);
+            if (q.empty()) {
+                return false;
+            }
+            ptr = &q.front();
+            q.pop();
+            return true;
+        }
+
+        bool empty() const {
+            std::lock_guard<std::mutex> guard(m_);
+            return q.empty();
+        };
+};
+#+end_src
+* 只保護共享數據的初始化
+某些時後, 共享數據要被併發訪問, 但只有在創建共享數據時需要被保護, 在創建好就不存在 =data race= 的情況; 比如, 某種支持併發讀的只讀數據。 假設這個共享數據要採取 =lazy initialization=, 只有在需要時才被初始化, 如果使用 =mutex= 則有以下實現:
+#+begin_src cpp
+class Resource;
+
+std::shared_ptr<Resource> res_ptr;
+std::mutex res_m_;
+void foo_read() {
+    std::unique_lock<std::mutex> lk (res_m_);
+    if (!res_ptr) {
+        res_ptr.reset(new Resource());
+    }
+    lk.unlock();
+    res_ptr->do_read();
+};
+#+end_src
+以上實現的問題在於, 所有調用 =foo_read= 的線程, 在檢查資源是否被初始化時, 都要 =lock=, 卻僅僅只是為了檢查狀態而已, 因此應使用兩階段檢驗, 但併發安全的兩階段檢驗會引入額外的問題, 我們在後面的章節再介紹。 /C++ STL/ 提供了 =std::once_flag= 與 =std::call_once()= 專門處理此場景。
+** once_flag 與 call_once() 使用
+=std::call_once()= 接收兩個參數, 一個是 =once_flag=, 一個是只允許被成功調用一次的函數, 以下為範例:
+#+begin_src cpp
+class Resource;
+
+std::shared_ptr<Resource> res_ptr;
+std::once_flag res_once_flag;
+void init_resource() {
+    res_ptr.reset(new Resource());
+}
+void do_read() {
+    std::call_once(res_once_flag, init_resource);
+    res_ptr->do_read();
+};
+#+end_src
+** 向 call_once 傳參數
+與向 =std::thread= 傳參數類似, =call_once= 可以傳參數給該函數, 並且傳入該對象的 =pointer= 做為第三個參數:
+#+begin_src cpp
+class Resource;
+std::shared_ptr<Resource> res_ptr;
+void init_resource(const std::string &arg) {
+    res_ptr.reset(new Resource(arg));
+}
+void do_read() {
+    std::call_once(res_once_flag, init_resource, std::string("info"));
+    res_ptr->do_read();
+};
+#+end_src
+** call_once 保護成員函數
+如果 =call_once= 要保護的函數是成員函數, 則也與 =std::thread= 相同, 該對象的 =pointer= 做為第三個參數:
+#+begin_src cpp
+class Session {
+    private:
+        SessionContext context;
+        ConnectionHandler connection;
+        std::onec_flag connection_init_falg;
+        void open_connection() {
+            connection = connection_manager.open(context);
+        }
+        State do_send_data(DataPack const &data_pack);
+    public:
+        Session(const SessionContext& context) : context(context) {};
+        State send_data(DataPack const &data_pack) {
+            std::call_once(connection_init_falg, &Session::open_connection, this);
+            return do_send_data(data_pack);
+        }
+}
+#+end_src
+** static 替代 call_once
+如果把函數的局部變量聲明成 =static=, 則該局部變量只在第一次被調用時被初始化, 而 /C++11/ 標準 =static= 的局部變量初始化支持了線程安全; 我們可以利用此特性來替代 =call_once=:
+#+begin_src cpp
+class ConcurrentReadOnlyData;
+
+ConcurrentReadOnlyData& get_data() {
+    static ConcurrentReadOnlyData data;
+    return data;
+};
+
+void do_read() {
+    auto data = get_data();
+    data->do_read();
+};
+#+end_src
+* 併發安全問題初探
+要詳細討論併發問題需要詳細探討內存模型, 我們會在後面的章節詳細討論, 本章節先討論幾個不涉及內存模型的併發安全問題, 這些問題非常普遍, 一不經意就會出現:
+ * =pointer= 或 =reference= 從臨界區中逃逸
+   =mutex= 之所以安全, 是因為不安全的訪問被保護在臨界區之內, 如果我們在臨界區內將 =pointer= 或 =reference= 給其他作用域, 則這些數據將不在安全; 即便我們很小心, 也有可能因為在臨界區之內有一些行為需要用戶自定義, 比如模板方法模式的鉤子函數, 則很可能就暴露了這些數據的安全性
+ * 併發安全操作的合併操作會破壞併發安全
+   如果有兩個併發安全的操作, 我們將之組合成一個, 將不再是安全的, 詳細的原理我們會在後續討論。 本節會透過討論併發安全容器設計的思路來探討擴展、實現併發安全的代碼應當考慮的細節
+** 避免 pointer 或 reference 從臨界區中逃逸
+透過 =std::mutex= 和 =std::lock_guard= 的使用案例可以觀察到, 受保護的數據安全的前提是共享數據的存取只發生在臨界區之內, 如果在臨界區之內向外部傳遞了受保護的數據的 =pointer= 或 =reference=, 都會導致該數據不在安全, 我們考慮考慮以下實現:
+#+begin_src cpp
+class Data {
+    std::string info;
+    public:
+        void process_data();
+};
+
+class ThreadSafeWrapper {
+    Data data;
+    std::mutex lock;
+    public:
+        template<typename F>
+        void process_data(F func) {
+            std::lock_guard<std::mutex> guard(lock);
+            func(data);
+        };
+}
+#+end_src
+以上實現是希望透過 =ThreadSafeWrapper= 提供安全且又用戶自定義的 =process_data=, 但這是不安全的, 原因是我們沒能限制 =func= 的型參; 我們可以透過實現一個惡意的函數, =func= 透過接收 =data= 的引用, 並將它保存在其他地方, 使其從臨界區中逃逸:
+#+begin_src cpp
+Data *p = nullptr;
+void malicious_data_process(Data &data) {   // 1
+    p = &data;
+};
+void oops() {
+    ThreadSafeWrapper w(data);
+    w.process_data(malicious_data_process); // 2
+    p->process_data();                      // 3
+};
+#+end_src
+1. =malicious_data_process= 接收參數 =Data&=, 並刻意將其 =pointer= 保存在其他地方, 此案例中是 global 的 =p=
+2. =w.process_data(malicious_data_process)= 的調用看似沒有問題, 但進入臨界區時被 =malicious_data_process= 使其逃逸
+3. 此後, =p= 將可以不受保護任意調用不安全的操作
+** 併發安全的容器初探
+以下是 =stack= 的 =interface= 定義:
+#+begin_src cpp
+template<typename T,typename Container=std::deque<T>>
+class stack {
+public:
+    explicit stack(const Container&);
+    explicit stack(Container&& = Container());
+    template <class Alloc> explicit stack(const Alloc&);
+    template <class Alloc> stack(const Container&, const Alloc&);
+    template <class Alloc> stack(Container&&, const Alloc&);
+    template <class Alloc> stack(stack&&, const Alloc&);
+    bool empty() const;
+    std::size_t size() const;
+    T& top();
+    const T& top() const;
+    void push(T const&);
+    void push(T&&);
+    void pop();
+    void swap(stack&&);
+    template <class... Args> void emplace(Args&&... args);
+};
+#+end_src
+我們考慮透過該 =interface= 直接實現一個線程安全的 =stack=; 使用一個 =mutex=, 保護所有對 =stack= 的存取行為, 除了保護 =push=, =pop= 等會修改 =stack= 的方法之外, 還保護對 =stack= 狀態的訪問如 =empty()=, =size()= 等。 但這樣做依然是存在 =data race=; 問題出在併發安全的操作的組合操作, 不是併發安全的, 考慮以下情境:
+1. 線程 A 判斷 =!stack.empty()= 成立, 要進行 =stack.top()= 操作時, 線程 B 此時對 =stack= 調用了 =stack.pop()=
+2. 線程 A 調用了 =stack.top()= 後, 打算調用 =stack.pop()= 之前, 線程 B 先調用了 =stack.pop()=
+** 實現 thread safe 容器需要考慮的問題
+這裡存在併發問題的根本原因是, 併發安全的操作組合起來, 並不是併發安全的, 即便有些操作可以透過用一個鎖合併並保護起來, 依然會有併發問題, 甚至會引出更多其他問題。 我們首先削減 =thread safe stack= 的能力, 然後討論哪些操作應該修改或合併:
+ * 削減 =thread safe stack= 的能力
+   所有對容器狀態的訪問, =empty()=, =size()=, =top()= 不再保證容器的精確狀態, 必須在文檔中清楚說明依賴這些方法會引發 =data race= 的問題
+ * =top()= 與 =pop()= 合併會引發的問題
+   /C++/ 容器是基於 =value= 的, 如果 =top()= 和 =pop()= 合併為 =pop()=, 其行為有兩步驟: return =top element=, 並將 =top element= 從 =stack= 中彈出。 只有 =stack= 的狀態被成功修改後, 彈出的 =element= 才會被成功 return, 問題救出現在這裡: =pop()= 的接收方有可能在構造對象時失敗, 此時 =element= 又已經完全脫離 =stack= 的掌控, 數據將不可恢復地丟失。 因此 /C++/ 才選擇將其拆成兩個步驟, =top()= 的接收方如果構造對象失敗, =stack= 就還能掌控該 =element=, 但這樣的實現就必然存在 =data race=
+ * 修改 =top()= 為 =reference= 語意
+   如果問題會由於構造對象的成敗導致, 我們就盡量縮減構造對象時間以及空間成本, 因此我們讓 =top()= 操作 return =shared_ptr=, 並且在文檔中明確說明 =top()= 不再保證容器的精確狀態
+ * 合併 =top()= 和 =pop()= 並提供兩種重載版本
+   =pop()= 整合了原有的 =top()= 和 =pop()= 功能, 有兩種重載實現, 第一種是接收一個 =pointer=, 用於 hold =top element=, 另一種是 return =shared_ptr=
+ * 封裝安全的組合操作
+   =top()=, =pop()= 等操作除了必須 =lock= 之外, =lock= 之後首先做 =empty= 檢查, 確保沒有未定義行為
+綜上所述, 基本上可以總結成:
+1. 獲取狀態的方法不再被保證
+2. 從容器中取值的操作以 =pointer= 的方式被 return, 避免構造對象異常
+3. 將組合操作重新封裝成安全的操作
+** thread safe stack 的實現
+#+begin_src cpp
+template<typename E>
+class threadsafe_stack {
+    struct empty_stack: std::exception {
+        const char* what() const noexcept {return "stack empty";};
+    };
+
+    private:
+        std::stack<E> stack;
+        mutable std::mutex m_;
+    public:
+        threadsafe_stack() {};
+        threadsafe_stack(const threadsafe_stack& other) {
+            std::lock_guard<std::mutex> guard(other.m_);
+            stack = other.stack;  // move assign
+        };
+        threadsafe_stack& operator=(const threadsafe_stack&) = delete;
+        void push(const E &element) {
+            std::lock_guard<std::mutex> guard(m_);
+            stack.push(element);
+        };
+        std::shared_ptr<E> pop() {
+            std::lock_guard<std::mutex> guard(m_);
+            if (stack.empty()) {
+                throw empty_stack();
+            }
+            const std::shared_ptr<E> p {std::make_shared<E>(stack.top())};
+            stack.pop();
+            return p;
+        };
+        void pop(E* ptr) {
+            std::lock_guard<std::mutex> guard(m_);
+            if (stack.empty()) {
+                throw empty_stack();
+            }
+            ptr = &stack.top();
+            stack.pop();
+        };
+        bool empty() const {
+            std::lock_guard<std::mutex> guard(m_);
+            return stack.empty();
+        };
+};
+#+end_src
+* 死鎖問題與解決方案
+死鎖的必要條件:
+ * 存在兩個線程 T1, T2, 並且都希望能獲取 L1, L2
+ * T1 先獲取了 L1, T2 先獲取了 L2, 互相等待對方式放
+ * T1, T2 完成操作前不釋放
+
+要避免死鎖問題只需要破壞死鎖的要件之一即可:
+1. 一次性獲取 L1, L2
+   如果成功, L1, L2 都會成功獲取, 如果失敗, 就都不獲取
+2. 依照順序獲取 L1, L2
+   T1, T2 統一按照一定順序獲取 lock
+3. try lock until
+   try lock 一定時間, 時間到無法 lock 就放棄
+** 一次性獲取 L1, L2
+/C++11/ 提供了 =std::lock()= 方法, 確保一次性對多個 =mutex= 類對象上鎖:
+#+begin_src cpp
+class Data;
+void swap(Data &l, Data &r);
+
+class DataWrapper {
+    private:
+        Data data;
+        mutable std::mutex m_;
+    public:
+        DataWrapper(const Data &data) : data(data) {};
+        friend void swap(DataWrapper &l, DataWrapper &r) {
+            if (&l == &r) {
+                return;
+            }
+            std::lock(l.m_, r.M.m_); // 1
+            std::lock_guard<std::mutex> l_guard(l.m_, std::adopt_lock); // 2
+            std::lock_guard<std::mutex> r_guard(e.m_, std::adopt_lock); // 2
+            swap(l.data, r.data);
+        }:
+};
+#+end_src
+1. =std::lock= 一次性對兩個 =mutex= 對象上鎖
+2. =std::lock_guard<std::mutex>= 構造函數的第二個參數傳入 =std::adopt_lock=, 其義為"收養"一個鎖, 也就是該 =mutex= 已經被 lock, 而 =lock_guard= 只須負責銷毀
+
+/C++17/ 提供了 =std::scoped_lock=, 比起 =std::lock_guard=, =std::scoped_lock= 支持模板類型推導以及可變參數實現, 因此可以一次接收多個 =mutex= 類型的對象, 相當於將 =std::lock= 與 =std::lock_guard= 的功能整合:
+#+begin_src cpp
+class Data;
+void swap(Data &l, Data &r);
+
+class DataWrapper {
+    private:
+        Data data;
+        mutable std::mutex m_;
+    public:
+        DataWrapper(const Data &data) : data(data) {};
+        friend void swap(DataWrapper &l, DataWrapper &r) {
+            if (&l == &r) {
+                return;
+            }
+            std::scoped_lock(l.m_, r.M.m_);
+            swap(l.data, r.data);
+        }:
+};
+#+end_src
+** 依次序上鎖
+假設我們有多種應用, 每種應用可能要獲取一系列鎖, 此時我們可以將每一步操作設定層級, 越靠近 0 代表最高層, 如果已經持有高層級鎖, 可以再持有低層級鎖, 但如果先持有低層級鎖則不能再持有高層級鎖, 以下為 =hierarchical_mutex= 的 declaration:
+#+begin_src cpp
+#ifndef __HIERARCHICAL_MUTEX_H__
+#define __HIERARCHICAL_MUTEX_H__
+#include <mutex>
+
+class hierarchical_mutex {
+    public:
+        explicit hierarchical_mutex(long long mutex_hierarchy); // 2
+        virtual ~hierarchical_mutex() noexcept = default;
+
+        void lock();            // 1
+        void unlock();          // 1
+        bool try_lock();        // 1
+
+    protected:
+    private:
+        mutable std::mutex m_;  // 2
+        long long const mutex_hierarchy; // 2
+        long long prev_hierarchy;        // 6
+        static thread_local long long thread_held_hierarchy; // 3
+        void check_for_hierarchy();                          // 4
+        void update_hierarchy();                             // 5
+};
+#endif // __HIERARCHICAL_MUTEX_H__
+#+end_src
+1. 我們要實做一個滿足 =Lockable= 類型的 =hierarchical_mutex=, 因此要實現這三個 member function
+2. 構造函數接收一個 =mutex_hierarchy= 用於區分不同的 =hierarchical_mutex= 層級
+3. =thread_held_hierarchy= 是當前線程已經持有的鎖的層級; 我們定義 =hierarchy= 0 代表最高層, 越大層級越低, 其值默認是 -1
+4. 當調用 =lock()= 時, 調用 =check_for_hierarchy()= 以確保 =thread= 是按照順序申請鎖
+5. 如果成功 =lock()=, 此時 =thread= 持有的 =thread_held_hierarchy= 要更新
+6. 調用 =unlock()= 時, 需要把 =thread_held_hierarchy= 改為之前的值。 注意, 如果 =thread= 成功 =lock()=, 則只有該 =thread= 能調用 =unlock()=, 也就是說該鎖對象在此期間是被該線程獨占的, 因此我們可以將 =prev_hierarchy= 值存在 =hierarchical_mutex= 的成員變量上, 當 =unlock= 時取回 =lock()= 時保存的值
+
+=hierarchical_mutex= definition:
+#+begin_src cpp
+thread_local long long hierarchical_mutex::thread_held_hierarchy = LLONG_MIN;
+
+hierarchical_mutex::hierarchical_mutex(long long mutex_hierarchy) :
+    mutex_hierarchy(mutex_hierarchy), prev_hierarchy(LLONG_MAX) {};
+
+void hierarchical_mutex::check_for_hierarchy() {
+    if (thread_held_hierarchy >= mutex_hierarchy) {
+        throw std::logic_error("hierarchical_mutex permission denied");
+    }
+};
+
+void hierarchical_mutex::update_hierarchy() {
+    prev_hierarchy = thread_held_hierarchy;
+    thread_held_hierarchy = mutex_hierarchy;
+};
+
+void hierarchical_mutex::lock() {
+    check_for_hierarchy();
+    m_.lock();
+    update_hierarchy();
+};
+
+void hierarchical_mutex::unlock() {
+    if (mutex_hierarchy != thread_held_hierarchy) {
+        throw std::logic_error("hierarchical_mutex unlock violated");
+    }
+    thread_held_hierarchy = prev_hierarchy;
+    m_.unlock();
+}
+
+bool hierarchical_mutex::try_lock() {
+    check_for_hierarchy();
+    if (!m_.try_lock()) {
+        return false;
+    }
+    update_hierarchy();
+    return true;
+}
+#+end_src
+demo 情境:
+1. t1 執行 =process_across_0_and_1= 會持有 0, 1 級鎖, 並作業 10 秒
+2. t2 在 t1 執行 5 秒後執行 =process_across_1_and_2=, 由於 t1 還在作業中, 因此將等待 t1 釋放 1 級鎖; 持有 1, 2 級鎖後, t2 作業 1 秒後結束
+#+begin_src cpp
+void process_across_0_and_1();
+void process_across_1_and_2();
+int main() {
+    auto t1 = std::thread(process_across_0_and_1);
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    auto t2 = std::thread(process_across_1_and_2);
+    t1.join();
+    t2.join();
+    return 0;
+}
+
+hierarchical_mutex level_0_mutex(0);
+hierarchical_mutex level_1_mutex(1);
+hierarchical_mutex level_2_mutex(2);
+using Clock = std::chrono::steady_clock;
+
+void process_across_0_and_1() {
+    auto start = Clock::now();
+    std::lock_guard<hierarchical_mutex> guard0(level_0_mutex);
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " held level 0 mutex, spent "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl;
+
+    std::lock_guard<hierarchical_mutex> guard1(level_1_mutex);
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " held level 1 mutex, spent "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl;
+
+    // simulate do something
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " process_across_0_and_1_task spent: "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl << std::endl;
+};
+
+void process_across_1_and_2() {
+    auto start = Clock::now();
+    std::lock_guard<hierarchical_mutex> guard1(level_1_mutex);
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " held level 1 mutex, spent "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl;
+
+    std::lock_guard<hierarchical_mutex> guard2(level_2_mutex);
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " held level 2 mutex, spent "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl;
+
+    // simulate do something
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    std::cout << "thread-id: " << std::this_thread::get_id()
+              << " process_across_1_and_2_task spent: "
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - start).count()
+              << " seconds" << std::endl << std::endl;
+};
+#+end_src
+** 死鎖問題的補充準則
+雖然死鎖問題經常由鎖引發, 但實際上在沒有使用鎖的情況也有可能導致死鎖問題。 比如有兩個線程各自關聯 =std::thread= 對象, 但由對方的 =std::thread= 負責 =join()= 也會導致死鎖。 我們把死鎖問題推廣, 我們實際尚要防範的是所有的同步行為, 因為同步相當於需要等待, 而死鎖問題的根源就是兩個 (或多個) 線程互相等待導致的

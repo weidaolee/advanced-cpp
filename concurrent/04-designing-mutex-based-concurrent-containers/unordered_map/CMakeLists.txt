@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.9)
+project(unordered_map)
+include_directories("${PROJECT_SOURCE_DIR}")
+add_compile_options("-std=c++17")
+add_compile_options("-pthread")
+add_executable(unordered_map "demo.cc")

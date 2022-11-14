@@ -1,0 +1,24 @@
+#+begin_src cpp
+template <typename T>
+class ThreadsafeQueue {
+    private:
+        struct Node {
+            std::shared_ptr<T> data;
+            std::unique_ptr<Node> next;
+        };
+        std::mutex head_m_;
+        std::mutex tail_m_;
+        std::unique_ptr<Node> head;
+        Node *tail;
+        std::condition_variable data_cond;
+
+    public:
+        ThreadsafeQueue() : head(new Node), tail(head.get()) {}
+        ThreadsafeQueue(const ThreadsafeQueue &other) = delete;
+        ThreadsafeQueue &operator=(const ThreadsafeQueue &other) = delete;
+        std::shared_ptr<T> try_pop();
+        std::shared_ptr<T> wait_and_pop();
+        void push(const T &data);
+        bool empty();
+};
+#+end_src
